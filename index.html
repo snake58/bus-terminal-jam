@@ -27,11 +27,11 @@
 </head>
 <body>
 <div id="wrap"><canvas id="c"></canvas></div>
-<div id="vstamp">v3</div>
+<div id="vstamp">v4</div>
 <script>
 /* Portal: none (itch.io / standalone).
    Sin SDK: el juego corre con localStorage y sin anuncios. */
-/* BUS TERMINAL BUILD v3 */
+/* BUS TERMINAL BUILD v4 */
 </script>
 <script>
 "use strict";
@@ -57,43 +57,234 @@ const Store = window.Store = window.Store || {
   set(k,v){ try{ localStorage.setItem("busterminal_"+k, String(v)); }catch(e){} return Promise.resolve(); }
 };
 
-/* ---------------- audio (WebAudio, muted-safe) ---------------- */
+/* ---------------- audio (WebAudio, muted-safe) ----------------
+   v4: generative lo-fi night music + layered SFX. Everything is
+   synthesized in code — zero external audio files. Music starts on
+   the first user gesture, ducks under the global mute switch, and
+   the scheduler idles while the tab is hidden. */
 const Sfx = window.Sfx = {
   ctx:null, muted:false,
+  _master:null, _musicBus:null, _noiseBuf:null, _delay:null,
+  _musicOn:false, _musicWanted:false, _mStep:0, _mNext:0, _mTimer:0,
+  mf(m){ return 440*Math.pow(2,(m-69)/12); },   // midi -> hz
+
   ensure(){
     if(this.ctx) return true;
     try{
       const AC = window.AudioContext || window.webkitAudioContext;
       if(!AC) return false;
-      this.ctx = new AC(); return true;
+      const ctx = this.ctx = new AC();
+      // master chain: sfx + music -> master -> destination
+      const master = this._master = ctx.createGain(); master.gain.value=1; master.connect(ctx.destination);
+      const mb = this._musicBus = ctx.createGain(); mb.gain.value=0.42; mb.connect(master);
+      // dreamy feedback delay for the melody
+      const dly = ctx.createDelay(1.0); dly.delayTime.value=0.34;
+      const fb = ctx.createGain(); fb.gain.value=0.32;
+      const wet = ctx.createGain(); wet.gain.value=0.5;
+      dly.connect(fb); fb.connect(dly); dly.connect(wet); wet.connect(mb);
+      this._delay = dly;
+      // shared 1s white-noise buffer (whooshes, thumps, pops)
+      const len = ctx.sampleRate|0, buf = ctx.createBuffer(1, len, ctx.sampleRate), ch = buf.getChannelData(0);
+      for(let i=0;i<len;i++) ch[i]=Math.random()*2-1;
+      this._noiseBuf = buf;
+      return true;
     }catch(e){ return false; }
   },
+  out(){ return this._master || (this.ctx && this.ctx.destination); },
+
   setMuted(m){
     this.muted = !!m;
-    try{ if(this.ctx){ if(m) this.ctx.suspend(); else if(this.ctx.state==="suspended") this.ctx.resume(); } }catch(e){}
+    try{
+      if(this.ctx){
+        if(m) this.ctx.suspend();
+        else if(this.ctx.state==="suspended") this.ctx.resume();
+      }
+    }catch(e){}
+    if(!m && this._musicWanted) this.startMusic();
     Store.set("muted", this.muted?"1":"0");
   },
-  tone(f0,f1,dur,type,vol,when){
+
+  /* ----- primitives ----- */
+  tone(f0,f1,dur,type,vol,when,dest){
     if(this.muted || !this.ensure()) return;
     try{
       const t=this.ctx.currentTime+(when||0), o=this.ctx.createOscillator(), g=this.ctx.createGain();
       o.type=type||"sine"; o.frequency.setValueAtTime(Math.max(30,f0),t);
-      o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);
+      if(f1&&f1!==f0) o.frequency.exponentialRampToValueAtTime(Math.max(30,f1),t+dur);
       g.gain.setValueAtTime(vol||0.12,t); g.gain.exponentialRampToValueAtTime(0.001,t+dur);
-      o.connect(g); g.connect(this.ctx.destination); o.start(t); o.stop(t+dur+0.03);
+      o.connect(g); g.connect(dest||this.out()); o.start(t); o.stop(t+dur+0.05);
     }catch(e){}
   },
-  click(){ this.tone(700,900,0.06,"square",0.06); },
-  board(){ this.tone(520,980,0.12,"sine",0.10); this.tone(780,1400,0.10,"sine",0.07,0.05); },
-  deny(){ this.tone(220,140,0.18,"sawtooth",0.08); },
-  coin(){ this.tone(1320,1760,0.09,"triangle",0.09); },
-  horn(){ this.tone(196,185,0.35,"sawtooth",0.10); this.tone(147,139,0.35,"sawtooth",0.08,0.02); },
-  depart(){ this.tone(120,420,0.5,"sawtooth",0.07); this.horn(); },
-  arrive(){ this.tone(300,120,0.4,"sawtooth",0.06); },
-  combo(n){ const b=440+Math.min(n,20)*22; this.tone(b,b*1.5,0.12,"triangle",0.10); this.tone(b*1.5,b*2,0.12,"triangle",0.08,0.08); },
-  freeze(){ this.tone(1800,600,0.4,"sine",0.07); },
-  win(){ const n=[523,659,784,1047]; n.forEach((f,i)=>this.tone(f,f,0.16,"triangle",0.10,i*0.11)); },
-  lose(){ const n=[392,330,262,196]; n.forEach((f,i)=>this.tone(f,f*0.94,0.22,"sawtooth",0.08,i*0.14)); },
+  noise(dur,vol,when,f0,f1,q){
+    // filtered noise burst: whooshes, air, impacts
+    if(this.muted || !this.ensure()) return;
+    try{
+      const t=this.ctx.currentTime+(when||0);
+      const s=this.ctx.createBufferSource(); s.buffer=this._noiseBuf; s.loop=true;
+      const f=this.ctx.createBiquadFilter(); f.type="bandpass"; f.Q.value=q||1.1;
+      f.frequency.setValueAtTime(Math.max(40,f0||800),t);
+      f.frequency.exponentialRampToValueAtTime(Math.max(40,f1||f0||800),t+dur);
+      const g=this.ctx.createGain();
+      g.gain.setValueAtTime(0.001,t);
+      g.gain.exponentialRampToValueAtTime(vol||0.1,t+dur*0.25);
+      g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+      s.connect(f); f.connect(g); g.connect(this.out());
+      s.start(t); s.stop(t+dur+0.05);
+    }catch(e){}
+  },
+  thump(vol,when){
+    // deep low-end hit for big moments
+    if(this.muted || !this.ensure()) return;
+    try{
+      const t=this.ctx.currentTime+(when||0), o=this.ctx.createOscillator(), g=this.ctx.createGain();
+      o.type="sine";
+      o.frequency.setValueAtTime(120,t);
+      o.frequency.exponentialRampToValueAtTime(38,t+0.28);
+      g.gain.setValueAtTime(vol||0.22,t);
+      g.gain.exponentialRampToValueAtTime(0.001,t+0.42);
+      o.connect(g); g.connect(this.out()); o.start(t); o.stop(t+0.5);
+      this.noise(0.18,(vol||0.22)*0.4,when,300,90,0.8);
+    }catch(e){}
+  },
+
+  /* ----- game SFX (layered, satisfying) ----- */
+  click(){ this.tone(660,990,0.07,"triangle",0.10); this.tone(1320,1320,0.04,"sine",0.05,0.01); },
+  board(){
+    // ascending pop: body sweep + bright ping + air tick
+    this.tone(420,940,0.11,"sine",0.14);
+    this.tone(840,1680,0.09,"triangle",0.07,0.02);
+    this.noise(0.06,0.05,0,5200,3200,1.4);
+  },
+  deny(){
+    this.tone(240,150,0.16,"sawtooth",0.09);
+    this.tone(252,158,0.16,"square",0.05,0.01);
+    this.tone(120,90,0.20,"sine",0.08,0.02);
+  },
+  coin(n){
+    // ding; pitch climbs with the combo streak
+    const k=1+Math.min(Math.max(n||0,0),24)*0.024, f=1318*k;
+    this.tone(f,f,0.10,"triangle",0.10);
+    this.tone(f*2,f*2,0.16,"sine",0.06,0.015);
+    this.tone(f*1.5,f*1.5,0.08,"sine",0.03,0.03);
+  },
+  horn(){
+    this.tone(196,186,0.40,"sawtooth",0.09);
+    this.tone(147,140,0.40,"sawtooth",0.08,0.02);
+    this.tone(98,96,0.40,"triangle",0.06,0.03);
+  },
+  depart(){
+    // whoosh + low thump + horn chord
+    this.noise(0.55,0.12,0,320,2600,0.9);
+    this.thump(0.16,0.05);
+    this.horn();
+  },
+  arrive(){
+    this.noise(0.50,0.07,0,2400,300,1.0);
+    this.tone(300,120,0.40,"triangle",0.05);
+  },
+  combo(n){
+    const b=440+Math.min(n||0,20)*22, st=[1,1.25,1.5];
+    st.forEach((m,i)=>this.tone(b*m,b*m*1.02,0.14,"triangle",0.09,i*0.07));
+    this.noise(0.20,0.04,0.14,6000,8000,1.2);
+  },
+  fullBus(){
+    // EPIC dispatch: sub thump + major chord stab + rising sparkle
+    this.thump(0.26,0);
+    const ch=[261.6,329.6,392,523.3];
+    ch.forEach((f,i)=>{ this.tone(f,f*1.003,0.50,"sawtooth",0.045,i*0.03); this.tone(f*2,f*2,0.40,"triangle",0.03,i*0.03); });
+    [880,1174,1568].forEach((f,i)=>this.tone(f,f,0.12,"sine",0.06,0.12+i*0.06));
+  },
+  freeze(){
+    this.tone(1800,500,0.45,"sine",0.08);
+    this.tone(2400,900,0.40,"triangle",0.05,0.05);
+    this.noise(0.40,0.05,0,7000,2500,1.5);
+  },
+  win(){
+    const n=[523.3,659.3,784,1046.5];
+    n.forEach((f,i)=>{ this.tone(f,f,0.22,"triangle",0.10,i*0.11); this.tone(f/2,f/2,0.22,"sine",0.05,i*0.11); });
+    this.thump(0.12,0.42);
+  },
+  lose(){
+    const n=[392,330,262,196];
+    n.forEach((f,i)=>this.tone(f,f*0.94,0.24,"sawtooth",0.07,i*0.15));
+    this.thump(0.20,0.50);
+  },
+
+  /* ----- generative lo-fi night music (pads + pentatonic + sub bass) ----- */
+  gesture(){
+    // call on the first real user tap/click
+    if(!this.ensure()) return;
+    try{ if(this.ctx.state==="suspended") this.ctx.resume(); }catch(e){}
+    this._musicWanted=true;
+    this.startMusic();
+  },
+  startMusic(){
+    if(this._musicOn||this.muted||!this._musicWanted||!this.ensure()) return;
+    this._musicOn=true; this._mStep=0;
+    this._mNext=this.ctx.currentTime+0.15;
+    if(!this._mTimer) this._mTimer=setInterval(()=>{ try{ this._sched(); }catch(e){} },110);
+  },
+  onShow(){
+    // re-align the scheduler after the tab was hidden (no catch-up burst)
+    if(this._musicOn&&this.ctx) this._mNext=Math.max(this._mNext,this.ctx.currentTime+0.1);
+  },
+  _pad(midis,t){
+    // soft slow-attack chord pad, one bar long
+    const ctx=this.ctx, dur=6.9;
+    midis.forEach(m=>{
+      const o=ctx.createOscillator(), g=ctx.createGain(), f=ctx.createBiquadFilter();
+      o.type="triangle"; o.frequency.value=this.mf(m); o.detune.value=(Math.random()*8-4);
+      f.type="lowpass"; f.frequency.value=1150;
+      g.gain.setValueAtTime(0.0001,t);
+      g.gain.linearRampToValueAtTime(0.05,t+1.6);
+      g.gain.setValueAtTime(0.05,t+dur-1.2);
+      g.gain.linearRampToValueAtTime(0.0001,t+dur);
+      o.connect(f); f.connect(g); g.connect(this._musicBus);
+      o.start(t); o.stop(t+dur+0.1);
+    });
+  },
+  _bass(m,t){
+    const ctx=this.ctx, o=ctx.createOscillator(), g=ctx.createGain();
+    o.type="sine"; o.frequency.value=this.mf(m);
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.linearRampToValueAtTime(0.13,t+0.03);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.7);
+    o.connect(g); g.connect(this._musicBus); o.start(t); o.stop(t+0.8);
+  },
+  _pluck(m,t,vel){
+    // pentatonic melody note with a little echo
+    const ctx=this.ctx, o=ctx.createOscillator(), o2=ctx.createOscillator(), g=ctx.createGain();
+    o.type="triangle"; o.frequency.value=this.mf(m);
+    o2.type="sine"; o2.frequency.value=this.mf(m)*2;
+    const v=vel||0.075, st=t+0.05;
+    g.gain.setValueAtTime(0.0001,t);
+    g.gain.linearRampToValueAtTime(v,t+0.015);
+    g.gain.exponentialRampToValueAtTime(0.001,t+1.1);
+    o.connect(g); o2.connect(g);
+    g.connect(this._musicBus); g.connect(this._delay);
+    o.start(st); o2.start(st); o.stop(st+1.2); o2.stop(st+1.2);
+  },
+  _sched(){
+    if(!this._musicOn||this.muted||!this.ctx) return;
+    if(typeof document!=="undefined"&&document.hidden){ this._mNext=this.ctx.currentTime+0.15; return; }
+    const SPB=60/72/2; // 8th notes @72bpm
+    if(this._mNext<this.ctx.currentTime-0.5) this._mNext=this.ctx.currentTime+0.1;
+    // Am7 - Fmaj7 - Cmaj7 - Em7, one bar (8 steps) each
+    const CH=[[57,60,64,67],[53,57,60,65],[48,55,59,64],[52,55,59,62]];
+    const BASS=[33,29,36,40];
+    const PENTA=[69,72,74,76,79,81,84]; // A minor pentatonic
+    // 32-step melody: scale degrees into PENTA, -1 = rest
+    const MEL=[4,-1,2,-1, 3,2,-1,1, 4,-1,5,4, 2,-1,1,-1,
+               3,-1,2,-1, 4,-1,6,5, 4,3,2,-1, 1,-1,0,-1];
+    while(this._mNext<this.ctx.currentTime+0.45){
+      const s=this._mStep, bar=(s>>3)%4, st=s%8, t=this._mNext+Math.random()*0.02;
+      if(st===0) this._pad(CH[bar],t);
+      if(st===0||st===4||st===6) this._bass(BASS[bar],t);
+      const dg=MEL[s%32];
+      if(dg>=0&&(st%2===0||Math.random()<0.35)) this._pluck(PENTA[dg],t,0.055+Math.random()*0.035);
+      this._mNext+=SPB; this._mStep++;
+    }
+  },
 };
 
 /* ---------------- palette ---------------- */
@@ -478,6 +669,7 @@ const Game = window.Game = {
   slotTaken:{}, spawnT:0, jamT:0, freezeT:0,
   combo:0, dispatched:0, target:6, levelCoins:0,
   shake:0, banner:"", bannerT:0, introT:0,
+  slowmo:0, fade:0,   // juice: brief slow-mo + soft state fade (render-only)
   tutStep:0, seenTut:false, muted:false,
   params:levelParams(1), time:0, clouds:[],
   bayRespawn:[0,0,0], rushQ:[], lastAd:0,
@@ -489,6 +681,7 @@ const Game = window.Game = {
   },
   setState(s){
     this.state=s;
+    if(s==="intro"||s==="levelcomplete"||s==="gameover") this.fade=380; // soft transition overlay
     try{
       if(s==="play") Portal.gameplayStart(); else Portal.gameplayStop();
     }catch(e){}
@@ -574,7 +767,7 @@ const Game = window.Game = {
     bus.aboard++; bus.wob=1;
     this.coins++; this.levelCoins++;
     this.combo++;
-    Sfx.board(); Sfx.coin();
+    Sfx.board(); Sfx.coin(this.combo);
     this.sparkle(bus.x+BUS_W-46, BAY_Y[bus.bay]-10, COLORS[bus.color].main);
     this.floater(bus.x+BUS_W-60, BAY_Y[bus.bay]-52, "+1", "#fde047", 16);
     this.removePassenger(p);
@@ -615,7 +808,9 @@ const Game = window.Game = {
       this.coins+=bonus; this.levelCoins+=bonus;
       this.confetti(240,420);
       this.floater(240,380,"FULL BUS! +$"+bonus,"#4ade80",22);
-      Sfx.win();
+      Sfx.fullBus();
+      this.shake=Math.max(this.shake,240); // subtle shake on the epic dispatch
+      this.slowmo=240;                     // brief slow-mo: juicy, logic-safe (dt is scaled)
     }
     this.dispatched++; this.totalDispatched++;
     try{ Portal.scoreChanged(this.coins); }catch(e){}
@@ -699,6 +894,7 @@ const Game = window.Game = {
     this.clouds.forEach(c=>c.x-=c.v*dt/1000);
     this.clouds=this.clouds.filter(c=>c.x>-120);
     if(this.shake>0) this.shake=Math.max(0,this.shake-dt);
+    if(this.fade>0) this.fade=Math.max(0,this.fade-dt);
     if(this.bannerT>0){ this.bannerT-=dt; if(this.bannerT<=0) this.banner=""; }
     this.floats.forEach(f=>{f.t+=dt; f.y-=34*dt/1000;});
     this.floats=this.floats.filter(f=>f.t<f.life);
@@ -780,7 +976,7 @@ const Game = window.Game = {
 
   /* ---------- input ---------- */
   onTap(x,y){
-    Sfx.ensure();
+    Sfx.ensure(); Sfx.gesture(); // first user gesture also starts the music
     if(this.state==="title"){
       if(hit(x,y,this.uiPlay)){ Sfx.click(); this.newGame(); return; }
       if(hit(x,y,this.uiMute)){ this.toggleMute(); return; }
@@ -893,6 +1089,12 @@ function draw(){
     if(Game.state==="gameover") drawGameOver();
   }
   ctx.restore();
+  // soft fade overlay between major states (title->game->win/lose): zero-alloc
+  if(Game.fade>0){
+    ctx.globalAlpha=clamp(Game.fade/380,0,1);
+    ctx.fillStyle="#04070f"; ctx.fillRect(0,0,LW,LH);
+    ctx.globalAlpha=1;
+  }
   // (vignette is baked into the background layers: no extra fullscreen pass)
 }
 
@@ -1286,7 +1488,10 @@ if(canvas&&canvas.addEventListener){
 if(typeof document!=="undefined"&&document.addEventListener){
   document.addEventListener("touchmove",e=>{ try{e.preventDefault();}catch(_){}} ,{passive:false});
   document.addEventListener("dblclick",e=>{ try{e.preventDefault();}catch(_){}} );
-  document.addEventListener("visibilitychange",()=>{ if(document.hidden) Game.autoPause(true); });
+  document.addEventListener("visibilitychange",()=>{
+    if(document.hidden) Game.autoPause(true);
+    else { try{ Sfx.onShow(); }catch(e){} }   // re-align music scheduler (no catch-up burst)
+  });
   if(typeof window!=="undefined") window.addEventListener("blur",()=>Game.autoPause(true));
 }
 
@@ -1295,7 +1500,8 @@ let lastT=0, frames=0;
 function frame(t){
   try{
     if(typeof requestAnimationFrame!=="undefined") requestAnimationFrame(frame);
-    const dt=Math.min(50,(t-lastT)||16); lastT=t;
+    let dt=Math.min(50,(t-lastT)||16); lastT=t;
+    if(Game.slowmo>0){ Game.slowmo=Math.max(0,Game.slowmo-dt); dt*=0.35; }  // hit slow-mo: brief juice, logic stays consistent
     Game.tick(dt); draw(); frames++;
     if(frames===2){ try{ Portal.gameReady(); }catch(e){} }
   }catch(e){ /* never die on a render error */ }
